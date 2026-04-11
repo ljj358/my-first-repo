@@ -1,0 +1,30 @@
+# macOS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+*.crdownload
+
+# Keil uVision user files
+DebugConfig/
+*.uvoptx
+*.uvguix.*
+
+# Keil build outputs
+Objects/
+Listings/
+*.axf
+*.bin
+*.build_log.htm
+*.crf
+*.d
+*.dep
+*.hex
+*.htm
+*.iex
+*.lnp
+*.lst
+*.map
+*.o
+*.sct
+*.bak
+*_sct.Bak
