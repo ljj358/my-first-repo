@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PPP 4G 串口模拟器</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; color: #1f2937; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    button, input { padding: 6px 10px; }
+    #log { white-space: pre-wrap; background: #0b1020; color: #d1e7ff; padding: 10px; border-radius: 8px; height: 420px; overflow: auto; font-family: Consolas, monospace; font-size: 12px; }
+    .status { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>PPP 协议 + 4G 模块串口模拟器</h1>
+  <div class="row">
+    <button id="btnConnect">连接串口</button>
+    <button id="btnDisconnect" disabled>断开</button>
+    <label>波特率 <input id="baudRate" type="number" value="115200" /></label>
+    <span>状态: <span id="status" class="status">未连接</span></span>
+    <span>模式: <span id="mode" class="status">AT</span></span>
+  </div>
+  <div class="row">
+    <button id="btnResetMode">强制回 AT 模式</button>
+    <button id="btnSendLcpReq">发送测试 LCP Conf-Req</button>
+  </div>
+  <div id="log"></div>
+
+  <script>
+    let port = null;
+    let reader = null;
+    let writer = null;
+    let running = false;
+    let pppMode = false;
+    let lineBuffer = "";
+    let frameBuffer = [];
+    let atFlushTimer = null;
+
+    function log(msg) {
+      const ts = new Date().toLocaleTimeString();
+      const el = document.getElementById("log");
+      el.textContent += `[${ts}] ${msg}\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(text) {
+      document.getElementById("status").textContent = text;
+    }
+
+    function setMode(text) {
+      document.getElementById("mode").textContent = text;
+    }
+
+    function hex(arr) {
+      return arr.map(b => b.toString(16).padStart(2, "0")).join(" ");
+    }
+
+    function toBytes(str) {
+      return Array.from(new TextEncoder().encode(str));
+    }
+
+    function pppFcs16(bytes) {
+      let fcs = 0xffff;
+      for (const b of bytes) {
+        let x = (fcs ^ b) & 0xff;
+        for (let i = 0; i < 8; i++) {
+          x = (x & 1) ? ((x >>> 1) ^ 0x8408) : (x >>> 1);
+        }
+        fcs = ((fcs >>> 8) ^ x) & 0xffff;
+      }
+      return (~fcs) & 0xffff;
+    }
+
+    function pppEscape(bytes) {
+      const out = [0x7e];
+      for (const b of bytes) {
+        if (b === 0x7e || b === 0x7d || b < 0x20) {
+          out.push(0x7d, b ^ 0x20);
+        } else {
+          out.push(b);
+        }
+      }
+      out.push(0x7e);
+      return out;
+    }
+
+    function buildPppFrame(protocol, info) {
+      const payload = [0xff, 0x03, (protocol >> 8) & 0xff, protocol & 0xff, ...info];
+      const fcs = pppFcs16(payload);
+      payload.push(fcs & 0xff, (fcs >> 8) & 0xff);
+      return pppEscape(payload);
+    }
+
+    function unescapePpp(bytes) {
+      const out = [];
+      for (let i = 0; i < bytes.length; i++) {
+        if (bytes[i] === 0x7d) {
+          i++;
+          if (i < bytes.length) out.push(bytes[i] ^ 0x20);
+        } else {
+          out.push(bytes[i]);
+        }
+      }
+      return out;
+    }
+
+    function parsePppFrame(rawFrameNoFlag) {
+      const fr = unescapePpp(rawFrameNoFlag);
+      if (fr.length < 6) return { ok: false, reason: "帧太短" };
+      const body = fr.slice(0, fr.length - 2);
+      const recvFcs = fr[fr.length - 2] | (fr[fr.length - 1] << 8);
+      const calcFcs = pppFcs16(body);
+      const fcsOk = recvFcs === calcFcs;
+
+      let protocol = 0;
+      let info = [];
+      if (body.length >= 4 && body[0] === 0xff && body[1] === 0x03) {
+        protocol = (body[2] << 8) | body[3];
+        info = body.slice(4);
+      } else if (body.length >= 2) {
+        protocol = (body[0] << 8) | body[1];
+        info = body.slice(2);
+      }
+      return { ok: true, fcsOk, protocol, info, raw: fr };
+    }
+
+    function protoName(p) {
+      switch (p) {
+        case 0xc021: return "LCP";
+        case 0x8021: return "IPCP";
+        case 0xc023: return "PAP";
+        case 0x0021: return "IP";
+        default: return "0x" + p.toString(16).padStart(4, "0");
+      }
+    }
+
+    async function writeBytes(arr) {
+      if (!writer) return;
+      await writer.write(new Uint8Array(arr));
+      log(`TX HEX: ${hex(arr)}`);
+    }
+
+    async function writeText(str) {
+      await writeBytes(toBytes(str));
+      log(`TX AT : ${JSON.stringify(str)}`);
+    }
+
+    async function flushAtLineFromBuffer() {
+      const line = lineBuffer.replace(/\r/g, "").trim();
+      lineBuffer = "";
+      if (line) {
+        await handleAtLine(line);
+      }
+    }
+
+    async function handleAtLine(line) {
+      const cmd = line.trim().toUpperCase();
+      log(`RX AT : ${JSON.stringify(line)}`);
+      if (!cmd) return;
+
+      if (cmd === "AT" || cmd === "ATE0") {
+        await writeText("\r\nOK\r\n");
+        return;
+      }
+      if (cmd.startsWith("AT+CGDCONT")) {
+        await writeText("\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "AT+CREG?") {
+        await writeText("\r\n+CREG: 0,1\r\n\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "AT+CPIN?") {
+        await writeText("\r\n+CPIN: READY\r\n\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "AT+CESQ") {
+        await writeText("\r\n+CESQ: 99,99,255,255,17,34\r\n\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "AT+CSQ") {
+        await writeText("\r\n+CSQ: 20,99\r\n\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "AT+CGMR") {
+        await writeText("\r\nEC20CEFDR02A08M4G\r\n\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "AT+CGSN=1") {
+        await writeText("\r\n+CGSN: 866569063318171\r\n\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "AT+QCCID") {
+        await writeText("\r\n+QCCID: 898604B9112280666086\r\n\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "AT+CCID") {
+        await writeText("\r\n+CCID: 898604B9112280666086\r\n\r\nOK\r\n");
+        return;
+      }
+      if (cmd === "ATD*99#") {
+        await writeText("\r\nCONNECT\r\n");
+        pppMode = true;
+        setMode("PPP");
+        log("已切换到 PPP 数据模式");
+        return;
+      }
+
+      await writeText("\r\nOK\r\n");
+    }
+
+    function buildLcpAck(info) {
+      if (info.length < 4) return null;
+      const code = info[0];
+      const id = info[1];
+      const len = (info[2] << 8) | info[3];
+      if (code !== 0x01 || info.length < len) return null;
+      const options = info.slice(4, len);
+      const ackInfo = [0x02, id, (len >> 8) & 0xff, len & 0xff, ...options];
+      return buildPppFrame(0xc021, ackInfo);
+    }
+
+    function buildIpcpAck(info) {
+      if (info.length < 4) return null;
+      const code = info[0];
+      const id = info[1];
+      const len = (info[2] << 8) | info[3];
+      if (code !== 0x01 || info.length < len) return null;
+      const options = info.slice(4, len);
+      const ackInfo = [0x02, id, (len >> 8) & 0xff, len & 0xff, ...options];
+      return buildPppFrame(0x8021, ackInfo);
+    }
+
+    function buildPapAck(info) {
+      if (info.length < 4) return null;
+      const code = info[0];
+      const id = info[1];
+      const msg = toBytes("Login OK");
+      const len = 5 + msg.length;
+      if (code !== 0x01) return null;
+      const ack = [0x02, id, (len >> 8) & 0xff, len & 0xff, msg.length, ...msg];
+      return buildPppFrame(0xc023, ack);
+    }
+
+    async function handlePppFrame(frameNoFlag) {
+      const parsed = parsePppFrame(frameNoFlag);
+      if (!parsed.ok) {
+        log(`RX PPP: 无效帧 (${parsed.reason})`);
+        return;
+      }
+      log(`RX PPP: proto=${protoName(parsed.protocol)}, fcs=${parsed.fcsOk ? "OK" : "BAD"}, len=${parsed.info.length}`);
+      log(`RX PPP HEX: ${hex(parsed.raw)}`);
+
+      let resp = null;
+      if (parsed.protocol === 0xc021) resp = buildLcpAck(parsed.info);
+      else if (parsed.protocol === 0x8021) resp = buildIpcpAck(parsed.info);
+      else if (parsed.protocol === 0xc023) resp = buildPapAck(parsed.info);
+
+      if (resp) {
+        await writeBytes(resp);
+        log(`TX PPP: 自动应答 ${protoName(parsed.protocol)}`);
+      }
+    }
+
+    async function consumeBytes(bytes) {
+      for (const b of bytes) {
+        if (!pppMode) {
+          if (b === 0x0d || b === 0x0a) {
+            await flushAtLineFromBuffer();
+          } else {
+            lineBuffer += String.fromCharCode(b);
+            if (lineBuffer.length > 300) lineBuffer = lineBuffer.slice(-300);
+            if (atFlushTimer) clearTimeout(atFlushTimer);
+            // 兼容未发送 \r/\n 的场景，空闲后尝试按一条命令处理
+            atFlushTimer = setTimeout(() => {
+              flushAtLineFromBuffer().catch((e) => log(`AT超时解析失败: ${e.message}`));
+            }, 80);
+          }
+        } else {
+          if (b === 0x7e) {
+            if (frameBuffer.length > 0) {
+              const one = frameBuffer.slice();
+              frameBuffer = [];
+              await handlePppFrame(one);
+            } else {
+              frameBuffer = [];
+            }
+          } else {
+            frameBuffer.push(b);
+            if (frameBuffer.length > 4096) {
+              log("PPP缓存溢出，丢弃");
+              frameBuffer = [];
+            }
+          }
+        }
+      }
+    }
+
+    async function readLoop() {
+      running = true;
+      while (running && port && port.readable) {
+        reader = port.readable.getReader();
+        try {
+          while (running) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value) await consumeBytes(Array.from(value));
+          }
+        } catch (e) {
+          log(`读串口异常: ${e.message}`);
+        } finally {
+          reader.releaseLock();
+          reader = null;
+        }
+      }
+    }
+
+    async function connect() {
+      if (!("serial" in navigator)) {
+        alert("当前浏览器不支持 Web Serial，请使用 Chrome/Edge。");
+        return;
+      }
+      const baudRate = Number(document.getElementById("baudRate").value || 115200);
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate });
+      writer = port.writable.getWriter();
+      setStatus("已连接");
+      document.getElementById("btnConnect").disabled = true;
+      document.getElementById("btnDisconnect").disabled = false;
+      log(`串口已打开，波特率=${baudRate}`);
+      await readLoop();
+    }
+
+    async function disconnect() {
+      running = false;
+      try { if (reader) await reader.cancel(); } catch (_) {}
+      try { if (writer) writer.releaseLock(); } catch (_) {}
+      writer = null;
+      try { if (port) await port.close(); } catch (_) {}
+      port = null;
+      setStatus("未连接");
+      document.getElementById("btnConnect").disabled = false;
+      document.getElementById("btnDisconnect").disabled = true;
+      log("串口已关闭");
+    }
+
+    async function sendTestLcpReq() {
+      if (!writer) return;
+      pppMode = true;
+      setMode("PPP");
+      const info = [
+        0x01, 0x01, 0x00, 0x0a,
+        0x05, 0x06, 0x00, 0x00, 0x00, 0x00
+      ];
+      await writeBytes(buildPppFrame(0xc021, info));
+      log("已发送测试 LCP Configure-Request");
+    }
+
+    document.getElementById("btnConnect").addEventListener("click", connect);
+    document.getElementById("btnDisconnect").addEventListener("click", disconnect);
+    document.getElementById("btnResetMode").addEventListener("click", () => {
+      pppMode = false;
+      frameBuffer = [];
+      lineBuffer = "";
+      setMode("AT");
+      log("手动切回 AT 模式");
+    });
+    document.getElementById("btnSendLcpReq").addEventListener("click", sendTestLcpReq);
+  </script>
+</body>
+</html>
